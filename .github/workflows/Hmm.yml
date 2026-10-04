@@ -1,0 +1,172 @@
+name: Build ZIX Kernel - Better Hiding
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Kernel (KSUN + SUSFS)
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 10240
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          ref: gaming
+          path: kernel
+          fetch-depth: 1
+
+      - name: Install Dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y git ccache automake flex lzop bison gperf \
+            build-essential zip curl zlib1g-dev gcc-multilib g++-multilib \
+            libc6-dev-i386 lib32ncurses-dev x11proto-core-dev libx11-dev \
+            lib32z-dev libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig \
+            python3 libssl-dev bc wget rsync
+
+      - name: Clone Toolchain
+        run: |
+          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 -b android14-release clang
+          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 -b android14-release gcc64
+          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9 -b android14-release gcc32
+
+      - name: Try Update KernelSU-Next
+        working-directory: kernel
+        continue-on-error: true
+        run: |
+          # Try official KernelSU-Next setup (may fail on old non-GKI, that's ok)
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next || true
+          echo "KernelSU-Next update attempt finished"
+
+      - name: Enable Better Hiding Configs
+        working-directory: kernel
+        run: |
+          # Create a fragment to force important configs
+          cat > hiding.config << 'EOF'
+          CONFIG_KSU=y
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=n
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_TMPFS_XATTR=y
+          CONFIG_OVERLAY_FS=y
+          EOF
+
+          # Merge into defconfig if possible
+          if [ -f arch/arm64/configs/surya_defconfig ]; then
+            cat hiding.config >> arch/arm64/configs/surya_defconfig
+          fi
+
+      - name: Build Kernel
+        working-directory: kernel
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export KBUILD_BUILD_USER="Grok"
+          export KBUILD_BUILD_HOST="BetterHiding"
+
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$GITHUB_WORKSPACE/gcc64/bin:$GITHUB_WORKSPACE/gcc32/bin:$PATH"
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE=aarch64-linux-android-
+          export CROSS_COMPILE_ARM32=arm-linux-androideabi-
+
+          export CC="ccache clang"
+          ccache -M 6G
+
+          # Defconfig
+          make O=out ARCH=arm64 surya_defconfig || make O=out ARCH=arm64 defconfig
+
+          # Apply extra configs
+          scripts/kconfig/merge_config.sh -m -O out arch/arm64/configs/surya_defconfig hiding.config || true
+          make O=out ARCH=arm64 olddefconfig
+
+          # Build
+          make -j$(nproc --all) O=out \
+            ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- 2>&1 | tee build.log
+
+      - name: Check Build
+        run: |
+          if [ -f kernel/out/arch/arm64/boot/Image.gz-dtb ]; then
+            echo "✅ Build Success - Image.gz-dtb found"
+          elif [ -f kernel/out/arch/arm64/boot/Image.gz ]; then
+            echo "✅ Build Success - Image.gz found"
+          else
+            echo "❌ Build Failed"
+            tail -80 kernel/build.log
+            exit 1
+          fi
+
+      - name: Setup AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+          rm -rf AnyKernel3/.git
+          rm -f AnyKernel3/README* AnyKernel3/anykernel.sh
+
+          cat > AnyKernel3/anykernel.sh << 'EOF'
+          properties() { '
+          kernel.string=ZIX Kernel | KSUN + SUSFS | Better Hiding | Surya
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=surya
+          device.name2=karna
+          '; }
+
+          block=/dev/block/bootdevice/by-name/boot;
+          is_slot_device=1;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+
+          . tools/ak3-core.sh;
+
+          ui_print " ";
+          ui_print "ZIX Kernel + KernelSU-Next + SUSFS";
+          ui_print "Better Root Hiding Build";
+          ui_print " ";
+
+          dump_boot;
+          write_boot;
+          EOF
+
+      - name: Package Zip
+        run: |
+          cd AnyKernel3
+          if [ -f ../kernel/out/arch/arm64/boot/Image.gz-dtb ]; then
+            cp ../kernel/out/arch/arm64/boot/Image.gz-dtb .
+          else
+            cp ../kernel/out/arch/arm64/boot/Image.gz .
+          fi
+
+          [ -f ../kernel/out/arch/arm64/boot/dtbo.img ] && cp ../kernel/out/arch/arm64/boot/dtbo.img .
+
+          zip -r9 ZIX-Surya-KSUN-SUSFS-BetterHiding-$(date +%Y%m%d-%H%M).zip * -x .git\* README\*
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZIX-Surya-BetterHiding
+          path: AnyKernel3/*.zip
+          retention-days: 5
